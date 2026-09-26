@@ -62,6 +62,8 @@ dropped at the source (see `src/lib/telemetry/catalog.ts`):
 | `diagnostics.exported` | — |
 | `history.restored` | `source` |
 | `history.tier` | `tier` |
+| `context.assembled` | `agent`, `sections`, `dropped`, `usedTokens`, `budgetTokens`, `sectionsCount`, `droppedCount` |
+
 
 Payload values are coerced to strings/numbers/booleans, capped at 256 chars
 each, and any key not in the per-event allowlist is stripped before send.

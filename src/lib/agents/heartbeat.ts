@@ -3,8 +3,9 @@ import { DATA_DIR, resolveAgentCwd } from "@/lib/storage/path-utils";
 import {
   readPersona,
   readMemory,
-  writeMemory,
+  listMemoryFiles,
   readInbox,
+  writeMemory,
   clearInbox,
   recordHeartbeat,
   markHeartbeatRunning,
@@ -12,6 +13,12 @@ import {
   getHeartbeatHistory,
   type AgentPersona,
 } from "./persona-manager";
+import {
+  assembleContext,
+  formatAssemblyReport,
+} from "./context-assembler";
+import type { ContextSection } from "./context-assembler";
+import { emit as emitTelemetry } from "@/lib/telemetry";
 import { renderPersonaBody } from "./persona-templating";
 import { readCabinetReferenceByPath } from "@/lib/cabinets/overview";
 import { readUserProfile } from "@/lib/user/profile-io";
@@ -54,7 +61,7 @@ import {
   resolveExecutionProviderId,
 } from "./adapters";
 
-interface HeartbeatContext {
+export interface HeartbeatContext {
   prompt: string;
   persona: AgentPersona;
   inbox: Array<{ from: string; timestamp: string; message: string }>;
@@ -62,7 +69,20 @@ interface HeartbeatContext {
   startTime: number;
 }
 
-async function buildHeartbeatContext(slug: string, cabinetPath?: string): Promise<HeartbeatContext | null> {
+/**
+ * Token budget applied to the assembled heartbeat prompt. The exact model is
+ * adapter-dependent, so we budget against a conservative shared context
+ * window: total = window − reserved output − system reserve.
+ */
+const HEARTBEAT_CONTEXT_WINDOW_TOKENS = 128_000;
+const HEARTBEAT_RESERVED_OUTPUT_TOKENS = 4_000;
+const HEARTBEAT_SYSTEM_RESERVE_TOKENS = 2_000;
+const HEARTBEAT_CONTEXT_BUDGET_TOKENS =
+  HEARTBEAT_CONTEXT_WINDOW_TOKENS -
+  HEARTBEAT_RESERVED_OUTPUT_TOKENS -
+  HEARTBEAT_SYSTEM_RESERVE_TOKENS;
+
+export async function buildHeartbeatContext(slug: string, cabinetPath?: string): Promise<HeartbeatContext | null> {
   const startTime = Date.now();
   const persona = await readPersona(slug, cabinetPath);
   if (!persona || !persona.active) return null;
@@ -70,6 +90,23 @@ async function buildHeartbeatContext(slug: string, cabinetPath?: string): Promis
   const context = await readMemory(slug, "context.md", cabinetPath);
   const decisions = await readMemory(slug, "decisions.md", cabinetPath);
   const learnings = await readMemory(slug, "learnings.md", cabinetPath);
+
+  // Persona memory files beyond the three named above get their own section
+  // (spec §4: sections = persona memory files via persona-manager).
+  const knownMemoryFiles = new Set(["context.md", "decisions.md", "learnings.md"]);
+  let extraMemoryFiles: string[] = [];
+  try {
+    extraMemoryFiles = (await listMemoryFiles(slug, cabinetPath))
+      .filter((f) => !knownMemoryFiles.has(f))
+      .sort();
+  } catch { /* memory dir unreadable — extra files are skipped */ }
+  let extraMemoryContext = "";
+  for (const file of extraMemoryFiles) {
+    const content = await readMemory(slug, file, cabinetPath);
+    if (content.trim()) {
+      extraMemoryContext += `### ${file.replace(/\.md$/, "")}\n${content}\n\n`;
+    }
+  }
 
   const inbox = await readInbox(slug, cabinetPath);
   const inboxText = inbox.length > 0
@@ -81,7 +118,7 @@ async function buildHeartbeatContext(slug: string, cabinetPath?: string): Promis
     const indexPath = path.join(DATA_DIR, focusPath, "index.md");
     if (await fileExists(indexPath)) {
       const content = await readFileContent(indexPath);
-      focusContext += `\n### ${focusPath}\n${content.slice(0, 500)}...\n`;
+      focusContext += `\n### ${focusPath}\n${content}\n`;
     }
   }
 
@@ -110,42 +147,28 @@ async function buildHeartbeatContext(slug: string, cabinetPath?: string): Promis
   } catch { /* ignore */ }
 
   const personaBody = await buildPersonaPromptBody(persona);
-  const prompt = `${personaBody}
 
----
-
-## Your Memory (from previous heartbeats)
-
-### Recent Context
-${context || "(no previous context)"}
-
-### Key Decisions
-${decisions || "(no decisions logged yet)"}
-
-### Learnings
-${learnings || "(no learnings yet)"}
-
----
-
-## Inbox (messages from other agents)
-${inboxText}
-
----
-
-## Focus Areas (recent state)
-${focusContext || "(no focus areas configured)"}
-
----
-
-## Goal Progress
-${goalsContext || "(no goals configured)"}
-
----
-
-## Task Inbox (tasks from other agents)
-${tasksContext || "(no pending tasks)"}
-
----
+  const sections: ContextSection[] = [
+    { name: "persona", priority: 100, content: `${personaBody}\n\n---`, trim: "truncate", floor: true },
+    {
+      name: "memory:context",
+      priority: 80,
+      content: `## Your Memory (from previous heartbeats)\n\n### Recent Context\n${context || "(no previous context)"}`,
+      trim: "truncate",
+    },
+    { name: "memory:decisions", priority: 80, content: `### Key Decisions\n${decisions || "(no decisions logged yet)"}`, trim: "truncate" },
+    { name: "memory:learnings", priority: 80, content: `### Learnings\n${learnings || "(no learnings yet)"}`, trim: "truncate" },
+    ...(extraMemoryContext.trim() ? [{ name: "memory:extra", priority: 75, content: extraMemoryContext.trim(), trim: "summarize" as const }] : []),
+    { name: "inbox", priority: 70, content: `---\n\n## Inbox (messages from other agents)\n${inboxText}`, trim: "truncate" },
+    { name: "focus", priority: 60, content: `---\n\n## Focus Areas (recent state)\n${focusContext || "(no focus areas configured)"}`, trim: "truncate" },
+    { name: "goals", priority: 50, content: `---\n\n## Goal Progress\n${goalsContext || "(no goals configured)"}`, trim: "truncate" },
+    { name: "tasks", priority: 40, content: `---\n\n## Task Inbox (tasks from other agents)\n${tasksContext || "(no pending tasks)"}`, trim: "truncate" },
+    {
+      name: "instructions",
+      priority: 90,
+      floor: true,
+      trim: "truncate",
+      content: `---
 
 ## Instructions for this heartbeat
 
@@ -177,10 +200,24 @@ ARTIFACT: relative/path/to/created-or-updated-kb-file
 Emit one ARTIFACT: line per file you created or updated. Do not combine multiple files on a single ARTIFACT: line.
 If you did not create or modify any file this heartbeat, still emit exactly one line \`ARTIFACT: none\` so the block is well-formed.
 
-Now execute your heartbeat. Check your focus areas, process inbox, review goals, and take action.`;
+Now execute your heartbeat. Check your focus areas, process inbox, review goals, and take action.`,
+    },
+  ];
+
+  const assembled = assembleContext(sections, { totalTokens: HEARTBEAT_CONTEXT_BUDGET_TOKENS });
+  const report = formatAssemblyReport(assembled);
+  emitTelemetry("context.assembled", {
+    agent: slug,
+    sections: report.sections,
+    dropped: report.dropped,
+    usedTokens: report.usedTokens,
+    budgetTokens: report.budgetTokens,
+    sectionsCount: assembled.sections.length,
+    droppedCount: assembled.dropped.length,
+  });
 
   const cwd = resolveAgentCwd(cabinetPath, persona.workdir);
-  return { prompt, persona, inbox, cwd, startTime };
+  return { prompt: assembled.prompt, persona, inbox, cwd, startTime };
 }
 
 async function processHeartbeatOutput(

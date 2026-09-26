@@ -20,6 +20,7 @@ export const ALLOWED_EVENTS = [
   "diagnostics.exported",
   "history.restored",
   "history.tier",
+  "context.assembled",
 ] as const;
 
 export type EventName = (typeof ALLOWED_EVENTS)[number];
@@ -58,4 +59,13 @@ export const EVENT_PAYLOAD_KEYS: Record<EventName, readonly string[]> = {
   "diagnostics.exported": [],
   "history.restored": ["source"],
   "history.tier": ["tier"],
+  "context.assembled": [
+    "agent",
+    "sections",
+    "dropped",
+    "usedTokens",
+    "budgetTokens",
+    "sectionsCount",
+    "droppedCount",
+  ],
 };
